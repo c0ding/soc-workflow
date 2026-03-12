@@ -1,0 +1,280 @@
+name: staging-centaur-engine
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: centaur-engine
+  SERVICE_NAME: centaur-engine
+  DOCKER_COMPOSE_PATH: /home/ubuntu/projects/centaur-engine/docker-compose.yml
+  APPLICATION_NAME: centaur-engine
+  DEPLOYMENT_ENV: staging
+  APP_PORT: 10041
+  EXTERNAL_PORT: 10042
+  HEALTH_ENDPOINT: /actuator/health/liveness
+  SHUTDOWN_TIMEOUT: 35
+  HEALTH_CHECK_TIMEOUT: 60
+  HEALTH_CHECK_INTERVAL: 5
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, x64, engine-staging]
+
+    env:
+      API_KEY: ${{ secrets.STAGING_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: 'amazing-socrates/centaur-engine'
+          ref: 'staging'
+          token: ${{ secrets.PAT }}
+          path: project-source
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.DEPLOYMENT_AWS_ACCESS_KEY_ID_STAGING }}
+          aws-secret-access-key: ${{ secrets.DEPLOYMENT_AWS_SECRET_ACCESS_KEY_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set SHORT_SHA
+        id: set_short_sha
+        run: |
+          cd project-source
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >>$GITHUB_ENV
+
+      - name: Set IMAGE_TAG
+        id: set_image_tag
+        run: |
+          cd project-source
+          echo "IMAGE_TAG=$SHORT_SHA" >> $GITHUB_ENV
+
+      - name: Build and push image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          cd project-source
+          chmod +x ./gradlew
+          ./gradlew clean build bootJar jib -x test -Djib.to.image=$ECR_REGISTRY/${{ env.ECR_REPOSITORY }} -Djib.to.tags=$IMAGE_TAG -Djib.container.ports=${{ env.APP_PORT }}
+          echo "image=$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Update docker-compose image
+        run: |
+          NEW_IMAGE="${{ steps.build.outputs.image }}"
+          echo "Updating ${{ env.DOCKER_COMPOSE_PATH }} with image: $NEW_IMAGE"
+          sed -i "s|image:.*${{ env.ECR_REPOSITORY }}.*|image: $NEW_IMAGE|g" ${{ env.DOCKER_COMPOSE_PATH }}
+          echo "Updated image in docker-compose:"
+          grep "image:" ${{ env.DOCKER_COMPOSE_PATH }}
+
+      - name: 执行优雅停机预处理
+        run: |
+          echo "执行优雅停机预处理..."
+          if [ ! -z "$API_KEY" ]; then
+            echo "发送预关闭请求到当前服务..."
+          
+            # 检查当前服务是否在运行
+            cd /home/ubuntu/projects/centaur-engine/
+            OLD_CONTAINER_ID=$(docker-compose ps -q "$SERVICE_NAME" 2>/dev/null || true)
+          
+            if [ ! -z "$OLD_CONTAINER_ID" ]; then
+              # 检查服务是否可访问
+              if docker exec "$OLD_CONTAINER_ID" wget --quiet --tries=1 --spider "http://localhost:$APP_PORT$HEALTH_ENDPOINT" 2>/dev/null; then
+                echo "服务运行正常，发送预关闭请求..."
+          
+                # 发送预关闭请求
+                curl -m $SHUTDOWN_TIMEOUT -X POST \
+                  -H "apiKey: ${API_KEY}" \
+                  "http://localhost:${EXTERNAL_PORT}/api/internal/prediction/pre-shutdown" \
+                  || echo "[Warn] Graceful shutdown request failed, proceeding with deployment"
+          
+                # 给应用时间处理正在进行的请求
+                echo "等待应用处理预关闭请求..."
+                sleep 10
+              else
+                echo "服务健康检查失败，跳过预关闭请求"
+              fi
+            else
+              echo "未找到运行的服务容器"
+            fi
+          else
+            echo "未设置API_KEY，跳过预关闭请求"
+          fi
+
+      - name: 拉取新镜像并部署
+        run: |
+          cd /home/ubuntu/projects/centaur-engine/
+          
+          echo "拉取新镜像: ${{ steps.build.outputs.image }}"
+          docker pull "${{ steps.build.outputs.image }}"
+          
+          echo "停止旧服务（优雅关闭）..."
+          docker-compose stop -t 60 "$SERVICE_NAME" 2>/dev/null || true
+          
+          echo "移除旧容器..."
+          docker-compose rm -f "$SERVICE_NAME" 2>/dev/null || true
+          
+          echo "启动新服务..."
+          docker-compose up -d "$SERVICE_NAME"
+          
+          echo "部署完成"
+
+      - name: 等待服务就绪
+        run: |
+          echo "等待服务启动..."
+          cd /home/ubuntu/projects/centaur-engine/
+          
+          # 等待容器启动
+          sleep 10
+          
+          # 检查容器状态
+          echo "容器状态:"
+          docker-compose ps "$SERVICE_NAME"
+          
+          # 健康检查
+          elapsed=0
+          MAX_RETRIES=$((HEALTH_CHECK_TIMEOUT / HEALTH_CHECK_INTERVAL))
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            CONTAINER_ID=$(docker-compose ps -q "$SERVICE_NAME")
+          
+            if [ -n "$CONTAINER_ID" ]; then
+              # 检查容器健康状态
+              CONTAINER_STATUS=$(docker inspect --format='{{.State.Status}}' "$CONTAINER_ID" 2>/dev/null || echo "unknown")
+          
+              if [ "$CONTAINER_STATUS" = "running" ]; then
+                # 尝试健康检查
+                if docker exec "$CONTAINER_ID" wget --quiet --tries=1 --spider "http://localhost:$APP_PORT$HEALTH_ENDPOINT" 2>/dev/null; then
+                  echo "✅ 容器内健康检查通过"
+          
+                  # 检查外部访问
+                  if curl -sf "http://localhost:$EXTERNAL_PORT$HEALTH_ENDPOINT" >/dev/null 2>&1; then
+                    echo "✅ 外部访问检查通过"
+          
+                    # 可选：验证API功能
+                    if [ ! -z "$API_KEY" ]; then
+                      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                        -H "apiKey: ${API_KEY}" \
+                        "http://localhost:$EXTERNAL_PORT/api/internal/prediction/engine/state" \
+                        2>/dev/null || echo "000")
+          
+                      if [[ "$HTTP_CODE" =~ ^[2|3][0-9][0-9]$ ]]; then
+                        echo "✅ API功能验证通过"
+                      else
+                        echo "⚠️  API响应异常: HTTP $HTTP_CODE"
+                      fi
+                    fi
+          
+                    echo "服务部署成功"
+                    exit 0
+                  else
+                    echo "外部访问检查失败，但容器运行正常"
+                  fi
+                fi
+              fi
+            fi
+          
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "等待服务就绪... ($RETRY_COUNT/$MAX_RETRIES)"
+            sleep $HEALTH_CHECK_INTERVAL
+          done
+          
+          echo "❌ 服务健康检查超时"
+          
+          # 输出日志用于调试
+          echo "容器日志:"
+          docker-compose logs "$SERVICE_NAME" --tail=30 || true
+          
+          exit 1
+
+      - name: 清理旧镜像
+        if: success()
+        run: |
+          echo "清理旧的Docker镜像..."
+          
+          # 保留最近2个版本的镜像
+          docker images "$ECR_REGISTRY/$ECR_REPOSITORY" --format "{{.Tag}}\t{{.CreatedAt}}" | \
+            sort -rk2 | tail -n +3 | cut -f1 | \
+            while read tag; do
+              echo "删除旧镜像: $tag"
+              docker rmi "$ECR_REGISTRY/$ECR_REPOSITORY:$tag" 2>/dev/null || true
+            done
+          
+          # 清理无用的镜像
+          docker image prune -f 2>/dev/null || true
+          echo "镜像清理完成"
+
+      - name: Notify Success to Lark Channel
+        if: success()
+        uses: carloschen6688/lark-message@v1
+        with:
+          title: "✅ ${{ env.APPLICATION_NAME }} ${{ env.DEPLOYMENT_ENV }} 部署成功"
+          content: |
+            🎉 **部署成功通知**
+            ═════════════════
+            📦 **项目:** ${{ github.repository }}
+            🏷️ **环境:** ${{ 
+              contains(env.DEPLOYMENT_ENV, 'prod') && '🚀 生产环境' ||
+              contains(env.DEPLOYMENT_ENV, 'stag') && '🧪 测试环境' ||
+              env.DEPLOYMENT_ENV
+            }}
+            🌿 **分支:** staging
+            👤 **触发者:** ${{ github.actor }}
+            🔧 **事件类型:** ${{ github.event_name }}
+            📝 **Commit:** ${{ env.SHORT_SHA }}
+            🏷️ **镜像标签:** ${{ env.IMAGE_TAG }}
+            ═════════════════
+            📋 [查看详细日志](https://github.com/${{ github.repository }}/commit/${{ github.sha }}/checks)
+          header-color: "green"
+          lark-bot-notify-webhook: ${{
+            contains(env.DEPLOYMENT_ENV, 'prod') &&
+            'https://open.larksuite.com/open-apis/bot/v2/hook/d191a0c9-5410-44f3-b5aa-b67ec8872bc2' ||
+            contains(env.DEPLOYMENT_ENV, 'stag') &&
+            'https://open.larksuite.com/open-apis/bot/v2/hook/7e21146a-7753-430b-acb9-fb99202e1f71' ||
+            'https://open.larksuite.com/open-apis/bot/v2/hook/7e21146a-7753-430b-acb9-fb99202e1f71'
+            }}
+
+      - name: Notify Failure to Lark Channel
+        if: failure()
+        uses: carloschen6688/lark-message@v1
+        with:
+          title: "❌ ${{ env.APPLICATION_NAME }} ${{ env.DEPLOYMENT_ENV }} 部署失败"
+          content: |
+            🚨 **部署失败通知**
+            ═════════════════
+            📦 **项目:** ${{ github.repository }}
+            🏷️ **环境:** ${{ 
+              contains(env.DEPLOYMENT_ENV, 'prod') && '🚀 生产环境' ||
+              contains(env.DEPLOYMENT_ENV, 'stag') && '🧪 测试环境' ||
+              env.DEPLOYMENT_ENV
+            }}
+            🌿 **分支:** staging
+            👤 **触发者:** ${{ github.actor }}
+            🔧 **事件类型:** ${{ github.event_name }}
+            📝 **Commit:** ${{ env.SHORT_SHA }}
+            🏷️ **镜像标签:** ${{ env.IMAGE_TAG }}
+            ═════════════════
+            📋 [查看详细日志](https://github.com/${{ github.repository }}/commit/${{ github.sha }}/checks)
+          header-color: "red"
+          lark-bot-notify-webhook: ${{
+            contains(env.DEPLOYMENT_ENV, 'prod') &&
+            'https://open.larksuite.com/open-apis/bot/v2/hook/d191a0c9-5410-44f3-b5aa-b67ec8872bc2' ||
+            contains(env.DEPLOYMENT_ENV, 'stag') &&
+            'https://open.larksuite.com/open-apis/bot/v2/hook/7e21146a-7753-430b-acb9-fb99202e1f71' ||
+            'https://open.larksuite.com/open-apis/bot/v2/hook/7e21146a-7753-430b-acb9-fb99202e1f71'
+            }}

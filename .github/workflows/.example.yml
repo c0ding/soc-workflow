@@ -1,0 +1,26 @@
+name: example
+
+on:
+  push:
+    branches:
+      - staging
+  workflow_dispatch:
+
+jobs:
+    dispatch:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Trigger repository dispatch event
+              uses: peter-evans/repository-dispatch@v4
+              with:
+                  token: ${{ secrets.PAT }}
+                  repository: amazing-socrates/soc-workflow
+                  event-type: staging-next-user
+                  client-payload: |
+                      {
+                        "source_repository": "${{ github.repository }}",
+                        "commit_sha": "${{ github.sha }}",
+                        "ref": "${{ github.ref }}",
+                        "pusher": "${{ github.actor }}",
+                        "app_name": "next-user"
+                      }

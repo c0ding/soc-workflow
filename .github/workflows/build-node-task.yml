@@ -1,0 +1,235 @@
+name: build task to ecs
+
+on:
+    workflow_call:
+        inputs:
+            APPLICATION_NAME:
+                required: true
+                type: string
+            AWS_REGION:
+                default: "us-east-2"
+                type: string
+            DEPLOYMENT_ENV:
+                required: true
+                type: string
+            ECR_REPOSITORY:
+                required: true
+                type: string
+            ECS_CLUSTER:
+                required: true
+                type: string
+            SECURITY_GROUP_IDS_SSM:
+                required: true
+                type: string
+            SUBNET_IDS_SSM:
+                required: true
+                type: string
+            VPC_ID_SSM:
+                required: true
+                type: string
+            SNS_TO_LARK_LAMBDA_ARN:
+                required: true
+                type: string
+            CERERTIFICATE_ARN:
+                required: true
+                type: string
+            ECS_EXECUTION_ROLE_ARN:
+                required: true
+                type: string
+            # Centrifugo配置参数
+            # 任务配置
+            TASK_DESIRED_COUNT:
+                required: false
+                type: string
+            TASK_CPU_SETTING:
+                required: false
+                type: string
+            TASK_MEMORY_SETTING:
+                required: false
+                type: string
+            APP_PORT:
+                required: true
+                type: string
+            REPO_NAME:
+                required: true
+                type: string
+            CF:
+                required: true
+                type: string
+            BRANCH_NAME:
+                required: true
+                type: string
+
+        secrets:
+            DEPLOYMENT_AWS_ACCESS_KEY_ID:
+                required: true
+            DEPLOYMENT_AWS_SECRET_ACCESS_KEY:
+                required: true
+            PAT:
+                required: true    
+jobs:
+    build:
+        name: Build and Push Image
+        runs-on: ubuntu-latest
+        outputs:
+            image_tag: ${{ steps.set-image-tag.outputs.IMAGE_TAG }}
+            short_sha: ${{ steps.set-short-sha.outputs.SHORT_SHA }}
+        concurrency: build-${{ inputs.APPLICATION_NAME }}-${{ inputs.DEPLOYMENT_ENV }}
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  repository: "amazing-socrates/${{inputs.REPO_NAME}}"
+                  ref: ${{ inputs.BRANCH_NAME }}
+                  token: ${{ secrets.PAT }}
+                  path: project-source
+                  fetch-depth: 0
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v1
+              with:
+                  aws-access-key-id: ${{ secrets.DEPLOYMENT_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.DEPLOYMENT_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ inputs.AWS_REGION }}
+
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@v1
+
+            - name: Set SHORT_SHA
+              id: set-short-sha
+              run: |
+                  cd project-source
+                  echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+                  echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+            - name: Set IMAGE_TAG
+              id: set-image-tag
+              run: |
+                  IMAGE_TAG="${{ inputs.APPLICATION_NAME }}-${{ env.SHORT_SHA }}"
+                  echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+                  echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+            - name: Build, tag, and push image to Amazon ECR
+              id: build-image
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+                  IMAGE_TAG: ${{ env.IMAGE_TAG }}
+              run: |
+                  cd project-source
+                  ECR_IMAGE="$ECR_REGISTRY/${{ inputs.ECR_REPOSITORY }}:$IMAGE_TAG"  
+                  docker build \
+                    --build-arg APP_NAME=${{ inputs.APPLICATION_NAME }} \
+                    --build-arg GIT_BRANCH=${{ inputs.BRANCH_NAME }} \
+                    --build-arg GIT_PAT_TOKEN=${{ secrets.PAT }} \
+                    --build-arg MODEL=${{ inputs.DEPLOYMENT_ENV }} \
+                    -t $ECR_REGISTRY/${{ inputs.ECR_REPOSITORY }}:$IMAGE_TAG .
+                  docker push $ECR_REGISTRY/${{ inputs.ECR_REPOSITORY }}:$IMAGE_TAG
+
+    cd:
+        name: Deploy to ${{ inputs.DEPLOYMENT_ENV }}
+        runs-on: ubuntu-latest
+        needs: build
+        concurrency: deployment-${{ inputs.APPLICATION_NAME }}-${{ inputs.DEPLOYMENT_ENV }}
+        env:
+            SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+            IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v1
+              with:
+                  aws-access-key-id: ${{ secrets.DEPLOYMENT_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.DEPLOYMENT_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ inputs.AWS_REGION }}
+            - name: Login to Amazon ECR for cd
+              id: login-ecr-cd
+              uses: aws-actions/amazon-ecr-login@v1
+            - name: Image Url
+              id: image-url
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr-cd.outputs.registry }}
+              run: |
+                    echo "::set-output name=image::$ECR_REGISTRY/${{ inputs.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+            - name: Deploy CloudFormation Stack    
+              uses: aws-actions/aws-cloudformation-github-deploy@v1
+              with:
+                  name: ${{ inputs.APPLICATION_NAME }}-${{ inputs.DEPLOYMENT_ENV }}
+                  template: ${{ inputs.CF }}
+                  no-fail-on-empty-changeset: "1"
+                  parameter-overrides: >-
+                      CertificateArn=${{ inputs.CERERTIFICATE_ARN }},
+                      ExecutionRoleArn=${{ inputs.ECS_EXECUTION_ROLE_ARN }},
+                      ECSClusterName=${{ inputs.ECS_CLUSTER }},
+                      ApplicationName=${{ inputs.APPLICATION_NAME }},
+                      EnvName=${{ inputs.DEPLOYMENT_ENV }},
+                      SecurityGroupIDs=${{ inputs.SECURITY_GROUP_IDS_SSM }},
+                      SubnetIDs=${{ inputs.SUBNET_IDS_SSM }},
+                      VpcID=${{ inputs.VPC_ID_SSM }},
+                      DockerImageUrl=${{ steps.image-url.outputs.image }},
+                      SnsToLarkLambda=${{ inputs.SNS_TO_LARK_LAMBDA_ARN }},
+                      AppPort=${{ inputs.APP_PORT }},
+                      TaskDesiredCount=${{ inputs.TASK_DESIRED_COUNT }},
+                      TaskCpuSetting=${{ inputs.TASK_CPU_SETTING }},
+                      TaskMemorySetting=${{ inputs.TASK_MEMORY_SETTING }}
+
+            - name: Notify Success to Lark Channel
+              if: success()
+              uses: carloschen6688/lark-message@v1
+              with:
+                  title: "✅ ${{ inputs.APPLICATION_NAME }} ${{ inputs.DEPLOYMENT_ENV }} 部署成功"
+                  content: |
+                      🎉 **部署成功通知**
+                      ═════════════════
+                      📦 **项目:** ${{ github.repository }}
+                      🏷️ **环境:** ${{
+                        contains(inputs.DEPLOYMENT_ENV, 'prod') && '🚀 生产环境' ||
+                        contains(inputs.DEPLOYMENT_ENV, 'stag') && '🧪 测试环境' ||
+                        inputs.DEPLOYMENT_ENV
+                      }}
+                      🌿 **分支:** ${{ inputs.BRANCH_NAME }}
+                      👤 **触发者:** ${{ github.event.client_payload.pusher }}
+                      🔧 **事件类型:** ${{ github.event_name }}
+                      📝 **Commit:** ${{ env.SHORT_SHA }}
+                      🏷️ **镜像标签:** ${{ env.IMAGE_TAG }}
+                      ═════════════════
+                      📋 [查看运行详情](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+                  header-color: "green"
+                  lark-bot-notify-webhook: ${{
+                      contains(inputs.DEPLOYMENT_ENV, 'prod') && 'https://open.larksuite.com/open-apis/bot/v2/hook/d191a0c9-5410-44f3-b5aa-b67ec8872bc2' ||
+                      contains(inputs.DEPLOYMENT_ENV, 'stag') && 'https://open.larksuite.com/open-apis/bot/v2/hook/7e21146a-7753-430b-acb9-fb99202e1f71' ||
+                      'https://open.larksuite.com/open-apis/bot/v2/hook/7e21146a-7753-430b-acb9-fb99202e1f71'
+                      }}
+
+            - name: Notify Failure to Lark Channel
+              if: failure()
+              uses: carloschen6688/lark-message@v1
+              with:
+                  title: "❌ ${{ inputs.APPLICATION_NAME }} ${{ inputs.DEPLOYMENT_ENV }} 部署失败"
+                  content: |
+                      🚨 **部署失败通知**
+                      ═════════════════
+                      📦 **项目:** ${{ github.repository }}
+                      🏷️ **环境:** ${{
+                        contains(inputs.DEPLOYMENT_ENV, 'stag') && '🧪 测试环境' ||
+                        inputs.DEPLOYMENT_ENV
+                      }}
+                      🌿 **分支:** ${{ inputs.BRANCH_NAME }}
+                      👤 **触发者:** ${{ github.event.client_payload.pusher }}
+                      🔧 **事件类型:** ${{ github.event_name }}
+                      📝 **Commit:** ${{ env.SHORT_SHA }}
+                      🏷️ **镜像标签:** ${{ env.IMAGE_TAG }}
+                      ═════════════════
+                      📋 [查看详细日志](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+                  header-color: "red"
+                  lark-bot-notify-webhook: ${{
+                      contains(inputs.DEPLOYMENT_ENV, 'prod') && 'https://open.larksuite.com/open-apis/bot/v2/hook/d191a0c9-5410-44f3-b5aa-b67ec8872bc2' ||
+                      contains(inputs.DEPLOYMENT_ENV, 'stag') && 'https://open.larksuite.com/open-apis/bot/v2/hook/7e21146a-7753-430b-acb9-fb99202e1f71' ||
+                      'https://open.larksuite.com/open-apis/bot/v2/hook/7e21146a-7753-430b-acb9-fb99202e1f71'
+                      }}
+
+
+

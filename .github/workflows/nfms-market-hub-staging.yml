@@ -1,0 +1,34 @@
+name: staging-nfms-market-hub
+
+on:
+    repository_dispatch:
+        types: [staging-nfms-market-hub]
+    workflow_dispatch:
+
+jobs:
+    call-deployment-in-local-repo:
+        uses: ./.github/workflows/build-default-task.yml
+        with:
+            AWS_REGION: ap-northeast-1
+            APPLICATION_NAME: nfms-market-hub
+            REPO_NAME: node-for-market-stream
+            BRANCH_NAME: staging
+            DEPLOYMENT_ENV: staging
+            CONTAINER_ENV_CONFIG: staging
+            ECR_REPOSITORY: nfms-mark-hub
+            ECS_CLUSTER: admin-be-staging
+            SECURITY_GROUP_IDS_SSM: /staging/security-groups
+            SUBNET_IDS_SSM: /staging/subnet-ids
+            VPC_ID_SSM: /staging/vpc-id
+            SNS_TO_LARK_LAMBDA_ARN: /staging/lambda/sns-to-lark
+            CERERTIFICATE_US_EAST_2_ARN: /staging/certificate
+            ECS_EXECUTION_ROLE_ARN: /staging/ecs-execution-role
+            CF: .github/workflows/awscf/nfms-main.yml
+            DOCKERFILE_PATH: Dockerfile.market-hub
+
+        secrets:
+            DEPLOYMENT_AWS_ACCESS_KEY_ID: ${{ secrets.DEPLOYMENT_AWS_ACCESS_KEY_ID_STAGING }}
+            DEPLOYMENT_AWS_SECRET_ACCESS_KEY: ${{ secrets.DEPLOYMENT_AWS_SECRET_ACCESS_KEY_STAGING }}
+            PAT: ${{ secrets.PAT }}
+            SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+            SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
